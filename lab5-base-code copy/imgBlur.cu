@@ -14,8 +14,10 @@
 #define BLUR_SIZE 21
 
 ///////////////////////////////////////////////////////
-//@@ INSERT YOUR CODE HERE
+//TODO: INSERT YOUR CODE HERE
 __global__ void blurKernel(float *out, float *in, int width, int height) {
+
+  printf("Hello, World!\n");
 }
 ///////////////////////////////////////////////////////
 
@@ -57,7 +59,9 @@ int main(int argc, char *argv[]) {
   timespec timer = tic();
   
   ////////////////////////////////////////////////
-  //@@ INSERT AND UPDATE YOUR CODE HERE
+  //TODO: INSERT AND UPDATE YOUR CODE HERE
+
+
 
   // Allocate cuda memory for device input and ouput image data
   cudaMalloc((void **)&deviceInputImageData,
