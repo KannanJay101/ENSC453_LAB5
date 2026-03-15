@@ -15,26 +15,37 @@
 #define BLOCK_SIZE 16
 
 ///////////////////////////////////////////////////////
-//@@ INSERT YOUR CODE HERE
+// Baseline box blur kernel (global memory, no tiling)
+// Each thread computes one output pixel by averaging all valid pixels
+// in a (BLUR_SIZE x BLUR_SIZE) neighbourhood centred on (x, y).
+// Border pixels use only the neighbours that fall inside the image
+// (clamped / partial-window averaging).
 __global__ void blurKernel(float *out, float *in, int width, int height) {
 
-  int x = blockIdx.x * blockDim.x + threadIdx.x; // calculate the x index of the current thread
-  int y = blockIdx.y * blockDim.y + threadIdx.y; // calculate the y index of the current thread
+  int x = blockIdx.x * blockDim.x + threadIdx.x; // column index
+  int y = blockIdx.y * blockDim.y + threadIdx.y; // row index
 
-  if (x < width && y < height) { // check if the current thread is within the bounds of the image
-    float sum = 0; // initialize the sum of the pixels to 0
-    int count = 0; // initialize the count of the pixels to 0
-    for (int i = -BLUR_SIZE / 2; i <= BLUR_SIZE / 2; i++) { // iterate over the blur size
-      for (int j = -BLUR_SIZE / 2; j <= BLUR_SIZE / 2; j++) { // iterate over the blur size
-        int nx = x + i;
-        int ny = y + j; // calculate the y index of the current pixel
+  if (x < width && y < height) {
+    float sum   = 0.0f;
+    int   count = 0;
+
+    // Half-width of the blur window
+    int half = BLUR_SIZE / 2;
+
+    for (int dy = -half; dy <= half; dy++) {      // row offset
+      for (int dx = -half; dx <= half; dx++) {    // column offset
+        int nx = x + dx;
+        int ny = y + dy;
+        // Only accumulate pixels that lie inside the image (clamp-to-border)
         if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-          sum += in[ny * width + nx]; // add the pixel value to the sum
+          sum += in[ny * width + nx];
           count++;
         }
       }
     }
-    out[y * width + x] = sum / count;
+
+    // count is always >= 1 because the centre pixel is always valid
+    out[y * width + x] = sum / (float)count;
   }
 }
 ///////////////////////////////////////////////////////
@@ -119,11 +130,21 @@ int main(int argc, char *argv[]) {
   // Check the correctness of your solution
   //wbSolution(args, outputImage);
 
-   for(int i=0; i<imageHeight; i++){
-     for(int j=0; j<imageWidth; j++){
-       if(fabs(hostOutputImageData[i*imageWidth+j]-goldOutputImageData[i*imageWidth+j])/goldOutputImageData[i*imageWidth+j]>0.01){
-         printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n", i, j, goldOutputImageData[i*imageWidth+j],hostOutputImageData[i*imageWidth+j]);
-	 return -1;
+   // Verify output against gold image.
+   // Use a mixed absolute+relative tolerance to handle near-zero gold values
+   // safely (pure relative check would divide by zero for black pixels).
+   const float ABS_TOL = 1e-4f;
+   const float REL_TOL = 0.01f;
+   for(int i = 0; i < imageHeight; i++){
+     for(int j = 0; j < imageWidth; j++){
+       float gold = goldOutputImageData[i*imageWidth+j];
+       float out  = hostOutputImageData [i*imageWidth+j];
+       float diff = fabsf(out - gold);
+       float tol  = REL_TOL * fabsf(gold) + ABS_TOL;
+       if(diff > tol){
+         printf("Incorrect output at pixel (row=%d, col=%d): gold=%f, output=%f, diff=%f\n",
+                i, j, gold, out, diff);
+         return -1;
        }
      }
    }
