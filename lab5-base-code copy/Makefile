@@ -7,7 +7,7 @@ imgBlur: imgBlur.o
 	/usr/local/cuda-11.0/bin/nvcc -ccbin g++ -m64 ${CUDA_ARCH} -o imgBlur imgBlur.o libwb/libwb.so -std=c++11
 
 imgBlur.o: imgBlur.cu my_timer.h
-	/usr/local/cuda-11.0/bin/nvcc -ccbin g++ -m64 ${CUDA_ARCH} -o imgBlur.o -c imgBlur.cu -std=c++11
+	/usr/local/cuda-11.0/bin/nvcc -ccbin g++ -m64 ${CUDA_ARCH} -O3 -use_fast_math ${EXTRA_NVCC_FLAGS} -o imgBlur.o -c imgBlur.cu -std=c++11
 
 #test input image size: 3840 x 2160
 run: imgBlur
