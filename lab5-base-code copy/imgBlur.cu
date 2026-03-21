@@ -22,10 +22,12 @@
 // Border pixels use only the neighbours that fall inside the image
 // (clamped / partial-window averaging).
 __global__ void blurKernel(float *out, float *in, int width, int height) {
+  
+  //One thread = one pixel
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (x >= width || y >= height) return;
+  if (x >= width || y >= height) return; //Boundary check
 
   float sum = 0.0f;
   int count = 0;
