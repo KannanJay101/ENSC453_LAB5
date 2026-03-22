@@ -1,22 +1,23 @@
 ///////////////////////////////////////////////////////////////////////////////
 // =========================================================================
-// VARIATION 1: SHARED MEMORY OPTIMIZATION ONLY
+// VARIATION: SHARED MEMORY OPTIMIZATION ONLY
 // =========================================================================
 //
-// What this version has:
-//   - Shared memory tiling (tile loaded into __shared__ array)
+// What CHANGED from baseline:
+//   - Kernel uses shared memory tiling (__shared__ tile array)
 //   - Each thread computes ONE output pixel from shared memory
-//   - Pinned memory for CPU-GPU transfers
 //
-// What this version does NOT have:
-//   - No computation reuse (no colSum, no L_PARAM)
-//   - No __ldg, no __restrict__, no #pragma unroll
+// What is IDENTICAL to baseline:
+//   - Pageable host memory (NO cudaMallocHost / pinned memory)
+//   - 10 kernel repeats for timing stability
+//   - No cudaFree(0) warmup before timing
+//   - Same cudaMemcpy from hostInputImageData directly
 //
-// Tile size:        58 x 58  (BLOCK_SIZE + 2*BLUR_SIZE = 16 + 42)
-// Threads per block: 256     (16 x 16)
+// Tile size:         58 x 58  (BLOCK_SIZE + 2*BLUR_SIZE = 16 + 42)
+// Threads per block: 256      (16 x 16)
 //
-// Compare execution time against baseline (1.265s) to get shared memory
-// speedup percentage:  speedup = (1.265 - this_time) / 1.265 * 100
+// Compare execution time against baseline (1.265s) to isolate the
+// shared memory speedup:  speedup = (1.265 - this_time) / 1.265 * 100
 ///////////////////////////////////////////////////////////////////////////////
 
 #include "libwb/wb.h"
@@ -35,26 +36,27 @@
 
 #define BLUR_SIZE 21
 #define BLOCK_SIZE 16
-#ifndef BLUR_KERNEL_REPEATS
-#define BLUR_KERNEL_REPEATS 1
-#endif
 
 #define OUT_WIDTH  BLOCK_SIZE                        // 16
 #define OUT_HEIGHT BLOCK_SIZE                        // 16
 #define TILE_WIDTH  (OUT_WIDTH  + 2 * BLUR_SIZE)     // 58
 #define TILE_HEIGHT (OUT_HEIGHT + 2 * BLUR_SIZE)     // 58
 
-__global__ void blurKernel(float *out, const float *in,
-                           int width, int height) {
+///////////////////////////////////////////////////////////////////////////////
+// Shared memory blur kernel.
+// Each thread block loads a tile (output region + halo) into shared memory,
+// then each thread computes its output pixel from the shared tile.
+// No computation reuse (no colSum, no L_PARAM).
+///////////////////////////////////////////////////////////////////////////////
+__global__ void blurKernel(float *out, float *in, int width, int height) {
 
-  // Shared memory tile: output region + halo on all sides
   __shared__ float tile[TILE_HEIGHT][TILE_WIDTH];
 
-  // Top-left corner of output region in global coords
+  // Top-left corner of this block's output region
   int outX0 = blockIdx.x * OUT_WIDTH;
   int outY0 = blockIdx.y * OUT_HEIGHT;
 
-  // Top-left corner of tile (includes halo)
+  // Top-left corner of the tile (includes halo)
   int tileStartX = outX0 - BLUR_SIZE;
   int tileStartY = outY0 - BLUR_SIZE;
 
@@ -104,14 +106,20 @@ __global__ void blurKernel(float *out, const float *in,
 
 int main(int argc, char *argv[]) {
   wbArg_t args;
-  int imageWidth, imageHeight;
+  int imageWidth;
+  int imageHeight;
   char *inputImageFile;
-  wbImage_t inputImage, outputImage, goldImage;
-  float *hostInputImageData, *hostOutputImageData;
-  float *deviceInputImageData, *deviceOutputImageData;
+  wbImage_t inputImage;
+  wbImage_t outputImage;
+  wbImage_t goldImage;
+  float *hostInputImageData;
+  float *hostOutputImageData;
+  float *deviceInputImageData;
+  float *deviceOutputImageData;
   float *goldOutputImageData;
 
   args = wbArg_read(argc, argv);
+
   inputImageFile = wbArg_getInputFile(args, 0);
   inputImage = wbImport(inputImageFile);
 
@@ -120,76 +128,89 @@ int main(int argc, char *argv[]) {
 
   imageWidth  = wbImage_getWidth(inputImage);
   imageHeight = wbImage_getHeight(inputImage);
+
   outputImage = wbImage_new(imageWidth, imageHeight, 1);
 
   hostInputImageData  = wbImage_getData(inputImage);
   hostOutputImageData = wbImage_getData(outputImage);
   goldOutputImageData = wbImage_getData(goldImage);
 
-  wbCheck(cudaFree(0));
+  timespec timer = tic();
 
-  size_t numBytes = imageWidth * imageHeight * sizeof(float);
+  ////////////////////////////////////////////////
+  // Same grid/block config as baseline
 
-  float *pinnedInput, *pinnedOutput;
-  wbCheck(cudaMallocHost((void **)&pinnedInput, numBytes));
-  wbCheck(cudaMallocHost((void **)&pinnedOutput, numBytes));
-  memcpy(pinnedInput, hostInputImageData, numBytes);
-
-  wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
-  wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
-
-  int numBlocksX = (imageWidth  + OUT_WIDTH  - 1) / OUT_WIDTH;
+  int numBlocksX = (imageWidth + OUT_WIDTH - 1) / OUT_WIDTH;
   int numBlocksY = (imageHeight + OUT_HEIGHT - 1) / OUT_HEIGHT;
   dim3 dimGrid(numBlocksX, numBlocksY);
   dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
 
-  timespec timer = tic();
+  size_t numBytes = imageWidth * imageHeight * sizeof(float);
 
-  wbCheck(cudaMemcpy(deviceInputImageData, pinnedInput, numBytes,
-                     cudaMemcpyHostToDevice));
+  // Pageable memory transfers — same as baseline, NO pinned memory
+  wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
+  wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
 
-  for (int i = 0; i < BLUR_KERNEL_REPEATS; i++) {
+  wbCheck(cudaMemcpy(deviceInputImageData, hostInputImageData,
+                     numBytes, cudaMemcpyHostToDevice));
+
+  // 10 kernel repeats — same as baseline
+  for (int i = 0; i < 10; i++) {
     blurKernel<<<dimGrid, dimBlock>>>(deviceOutputImageData,
                                       deviceInputImageData,
                                       imageWidth, imageHeight);
     wbCheck(cudaGetLastError());
   }
+
   wbCheck(cudaDeviceSynchronize());
 
-  wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,
+  wbCheck(cudaMemcpy(hostOutputImageData, deviceOutputImageData,
                      numBytes, cudaMemcpyDeviceToHost));
-  memcpy(hostOutputImageData, pinnedOutput, numBytes);
+
+  ///////////////////////////////////////////////////////
 
   toc(&timer, "GPU execution time (including data transfer) in seconds");
 
-  // Correctness check
+  // Correctness check against golden output
   for (int i = 0; i < imageHeight; i++) {
     for (int j = 0; j < imageWidth; j++) {
       float gold = goldOutputImageData[i * imageWidth + j];
       float outv = hostOutputImageData[i * imageWidth + j];
+
       if (fabs(gold) > 1e-6f) {
         if (fabs(outv - gold) / fabs(gold) > 0.01f) {
-          printf("Incorrect at (%d, %d): gold=%f, out=%f\n", i, j, gold, outv);
-          cudaFreeHost(pinnedInput); cudaFreeHost(pinnedOutput);
-          cudaFree(deviceInputImageData); cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage); wbImage_delete(inputImage); wbImage_delete(goldImage);
+          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
+                 i, j, gold, outv);
+          cudaFree(deviceInputImageData);
+          cudaFree(deviceOutputImageData);
+          wbImage_delete(outputImage);
+          wbImage_delete(inputImage);
+          wbImage_delete(goldImage);
           return -1;
         }
       } else {
         if (fabs(outv - gold) > 1e-6f) {
-          printf("Incorrect at (%d, %d): gold=%f, out=%f\n", i, j, gold, outv);
-          cudaFreeHost(pinnedInput); cudaFreeHost(pinnedOutput);
-          cudaFree(deviceInputImageData); cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage); wbImage_delete(inputImage); wbImage_delete(goldImage);
+          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
+                 i, j, gold, outv);
+          cudaFree(deviceInputImageData);
+          cudaFree(deviceOutputImageData);
+          wbImage_delete(outputImage);
+          wbImage_delete(inputImage);
+          wbImage_delete(goldImage);
           return -1;
         }
       }
     }
   }
+
   printf("Correct output image!\n");
 
-  cudaFreeHost(pinnedInput); cudaFreeHost(pinnedOutput);
-  cudaFree(deviceInputImageData); cudaFree(deviceOutputImageData);
-  wbImage_delete(outputImage); wbImage_delete(inputImage); wbImage_delete(goldImage);
+  cudaFree(deviceInputImageData);
+  cudaFree(deviceOutputImageData);
+
+  wbImage_delete(outputImage);
+  wbImage_delete(inputImage);
+  wbImage_delete(goldImage);
+
   return 0;
 }
