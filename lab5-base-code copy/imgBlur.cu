@@ -142,7 +142,7 @@ int main(int argc, char *argv[]) {
 
   ///////////////////////////////////////////////////////
 
-  toc(&timer, "GPU execution time (including data transfer) in seconds");
+  toc(&timer, "GPU execution time (baseline) in seconds");
 
   // Correctness check against golden output
   for (int i = 0; i < imageHeight; i++) {
