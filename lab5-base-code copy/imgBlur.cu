@@ -113,7 +113,7 @@ int main(int argc, char *argv[]) {
                      numBytes, cudaMemcpyDeviceToHost));
   ///////////////////////////////////////////////////////
 
-  toc(&timer, "GPU execution time (including data transfer) in seconds");
+  toc(&timer, "GPU execution time (Baseline) in seconds");
 
   for (int i = 0; i < imageHeight; i++) {
     for (int j = 0; j < imageWidth; j++) {
