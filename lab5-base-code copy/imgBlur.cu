@@ -1,72 +1,91 @@
-///////////////////////////////////////////////////////////////////////////////
-// =========================================================================
-// VARIATION: DATA TRANSFER OPTIMIZATION ONLY
-// =========================================================================
-//
-// What CHANGED from baseline:
-//   - Pinned host memory (cudaMallocHost) for faster CPU-GPU DMA transfers
-//   - cudaFree(0) warmup before timing to exclude CUDA context init
-//
-// What is IDENTICAL to baseline:
-//   - Naive blur kernel (reads directly from global memory, NO shared memory)
-//   - 10 kernel repeats for timing stability
-//   - Same grid/block dimensions (BLOCK_SIZE x BLOCK_SIZE = 16 x 16)
-//
-// Tile size:         N/A     (no tiling)
-// Threads per block: 256     (16 x 16)
-//
-// Compare execution time against baseline (1.265s) to isolate the
-// data transfer speedup:  speedup = (1.265 - this_time) / 1.265 * 100
-///////////////////////////////////////////////////////////////////////////////
-
 #include "libwb/wb.h"
 #include "my_timer.h"
-#include <math.h>
+#include <cmath>
 
-#define wbCheck(stmt)                                                   \
-  do {                                                                  \
-    cudaError_t err = stmt;                                             \
-    if (err != cudaSuccess) {                                           \
-      wbLog(ERROR, "Failed to run stmt ", #stmt);                       \
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));    \
-      return -1;                                                        \
-    }                                                                   \
+#define wbCheck(stmt)							\
+  do {									\
+    cudaError_t err = stmt;						\
+    if (err != cudaSuccess) {						\
+      wbLog(ERROR, "Failed to run stmt ", #stmt);			\
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));	\
+      return -1;							\
+    }									\
   } while (0)
 
 #define BLUR_SIZE 21
 #define BLOCK_SIZE 16
 
-///////////////////////////////////////////////////////////////////////////////
-// Baseline box blur kernel (global memory, no tiling) — UNCHANGED
-// Each thread computes one output pixel by averaging all valid pixels
-// in a (BLUR_SIZE x BLUR_SIZE) neighbourhood centred on (x, y).
-///////////////////////////////////////////////////////////////////////////////
-__global__ void blurKernel(float *out, float *in, int width, int height) {
+///////////////////////////////////////////////////////
+//@@ INSERT YOUR CODE HERE
+#ifndef C
+#define C 4
+#endif
 
-  int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void blurKernel(float *out, const float *in, int width, int height) {
+    // Shared memory allocated for the tile and its horizontal halos
+    // size = BLOCK_SIZE rows * (C * BLOCK_SIZE + 2 * BLUR_SIZE) columns
+    __shared__ float sh_col_sums[BLOCK_SIZE][C * BLOCK_SIZE + 2 * BLUR_SIZE];
 
-  if (x >= width || y >= height) return;
+    int ty = threadIdx.y;
+    int tx = threadIdx.x;
+    int global_r = blockIdx.y * BLOCK_SIZE + ty;
+    
+    // Total elements to load and calculate in shared memory by this block
+    int total_elements = BLOCK_SIZE * (C * BLOCK_SIZE + 2 * BLUR_SIZE);
+    int tid = ty * BLOCK_SIZE + tx;
 
-  float sum = 0.0f;
-  int count = 0;
+    // Phase 1: Collaboratively calculate vertical sums for all required columns
+    for (int i = tid; i < total_elements; i += BLOCK_SIZE * BLOCK_SIZE) {
+        int local_r = i / (C * BLOCK_SIZE + 2 * BLUR_SIZE);
+        int local_c = i % (C * BLOCK_SIZE + 2 * BLUR_SIZE);
 
-  for (int i = -BLUR_SIZE; i <= BLUR_SIZE; i++) {
-    for (int j = -BLUR_SIZE; j <= BLUR_SIZE; j++) {
-      int nx = x + j;
-      int ny = y + i;
+        int current_global_r = blockIdx.y * BLOCK_SIZE + local_r;
+        int current_global_c = blockIdx.x * (C * BLOCK_SIZE) - BLUR_SIZE + local_c;
 
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        sum += in[ny * width + nx];
-        count++;
-      }
+        float v_sum = 0.0f;
+        // Check if the current column is within the image bounds
+        // If it's outside, it will safely store 0.0f.
+        if (current_global_c >= 0 && current_global_c < width) {
+            int r_min = max(0, current_global_r - BLUR_SIZE);
+            int r_max = min(height - 1, current_global_r + BLUR_SIZE);
+            
+            for (int r = r_min; r <= r_max; ++r) {
+                v_sum += in[r * width + current_global_c];
+            }
+        }
+        sh_col_sums[local_r][local_c] = v_sum;
     }
-  }
 
-  out[y * width + x] = sum / count;
+    // Wait for all threads to finish computing their subset of the vertical sums
+    __syncthreads();
+
+    // Phase 2: Compute the horizontal sums and write to output
+    if (global_r < height) {
+        // Each thread calculates C output pixels horizontally!
+        for (int iter = 0; iter < C; ++iter) {
+            int local_out_c = iter * BLOCK_SIZE + tx;
+            int global_c = blockIdx.x * (C * BLOCK_SIZE) + local_out_c;
+
+            if (global_c < width) {
+                float h_sum = 0.0f;
+                // Add the pre-calculated vertical sums horizontally
+                for (int dy = 0; dy <= 2 * BLUR_SIZE; ++dy) {
+                    h_sum += sh_col_sums[ty][local_out_c + dy];
+                }
+
+                // Compute exact number of valid pixels by calculating bounded rectangle dimension
+                int r_min = max(0, global_r - BLUR_SIZE);
+                int r_max = min(height - 1, global_r + BLUR_SIZE);
+                int c_min = max(0, global_c - BLUR_SIZE);
+                int c_max = min(width - 1, global_c + BLUR_SIZE);
+                int numPixels = (r_max - r_min + 1) * (c_max - c_min + 1);
+
+                out[global_r * width + global_c] = h_sum / (float)numPixels;
+            }
+        }
+    }
 }
-
-///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
   wbArg_t args;
@@ -113,7 +132,7 @@ int main(int argc, char *argv[]) {
   wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
   wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
 
-  int numBlocksX = (imageWidth + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int numBlocksX = (imageWidth + C * BLOCK_SIZE - 1) / (C * BLOCK_SIZE);
   int numBlocksY = (imageHeight + BLOCK_SIZE - 1) / BLOCK_SIZE;
   dim3 dimGrid(numBlocksX, numBlocksY);
   dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
@@ -142,7 +161,7 @@ int main(int argc, char *argv[]) {
 
   ///////////////////////////////////////////////////////
 
-  toc(&timer, "GPU execution time (including data transfer) in seconds");
+  toc(&timer, "GPU execution time (Data Transfer + Shared Mem Optimization) in seconds");
 
   // Correctness check against golden output
   for (int i = 0; i < imageHeight; i++) {
@@ -154,8 +173,6 @@ int main(int argc, char *argv[]) {
         if (fabs(outv - gold) / fabs(gold) > 0.01f) {
           printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
                  i, j, gold, outv);
-          cudaFreeHost(pinnedInput);
-          cudaFreeHost(pinnedOutput);
           cudaFree(deviceInputImageData);
           cudaFree(deviceOutputImageData);
           wbImage_delete(outputImage);
@@ -167,8 +184,6 @@ int main(int argc, char *argv[]) {
         if (fabs(outv - gold) > 1e-6f) {
           printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
                  i, j, gold, outv);
-          cudaFreeHost(pinnedInput);
-          cudaFreeHost(pinnedOutput);
           cudaFree(deviceInputImageData);
           cudaFree(deviceOutputImageData);
           wbImage_delete(outputImage);
