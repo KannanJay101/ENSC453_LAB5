@@ -150,7 +150,7 @@ int main(int argc, char *argv[]) {
 
   toc(&timer, "GPU execution time (including data transfer) in seconds");
 
-  // Correctness check
+  // Correctness check against golden output
   for (int i = 0; i < imageHeight; i++) {
     for (int j = 0; j < imageWidth; j++) {
       float gold = goldOutputImageData[i * imageWidth + j];
