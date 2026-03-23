@@ -1,123 +1,86 @@
-///////////////////////////////////////////////////////////////////////////////
-// =========================================================================
-// VARIATION: SHARED MEMORY OPTIMIZATION ONLY
-// =========================================================================
-//
-// What CHANGED from baseline:
-//   - Kernel uses shared memory tiling with separable row-sum / column-sum
-//     computation reuse (3-phase approach)
-//   - TILE_I parameter controls output region size
-//
-// What is IDENTICAL to baseline:
-//   - Pageable host memory (NO cudaMallocHost / pinned memory)
-//   - NO cudaFree(0) warmup
-//   - 10 kernel repeats for timing stability
-//   - cudaMemcpy directly from hostInputImageData
-//
-// Compare execution time against baseline (1.265s) to isolate the
-// shared memory speedup:  speedup = (1.265 - this_time) / 1.265 * 100
-///////////////////////////////////////////////////////////////////////////////
-
 #include "libwb/wb.h"
 #include "my_timer.h"
-#include <math.h>
+#include <cmath>
 
-#define wbCheck(stmt)                                                     \
-  do {                                                                    \
-    cudaError_t err = stmt;                                               \
-    if (err != cudaSuccess) {                                             \
-      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));      \
-      return -1;                                                          \
-    }                                                                     \
+#define wbCheck(stmt)             \
+  do {                  \
+    cudaError_t err = stmt;           \
+    if (err != cudaSuccess) {           \
+      wbLog(ERROR, "Failed to run stmt ", #stmt);     \
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));  \
+      return -1;              \
+    }                 \
   } while (0)
 
-#define BLUR_SIZE  21
+#define BLUR_SIZE 21
 #define BLOCK_SIZE 16
-#define TILE_I     2
 
-///////////////////////////////////////////////////////////////////////////////
-// Optimised blur kernel — shared memory + separable row/column sum reuse
-///////////////////////////////////////////////////////////////////////////////
-__global__ void blurKernelShared(float *out, float *in,
-                                 int width, int height) {
+///////////////////////////////////////////////////////
+//@@ INSERT YOUR CODE HERE
+__global__ void blurKernel(float *out, const float *in, int width, int height) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  const int OUTPUT_DIM = TILE_I * BLOCK_SIZE;
-  const int TILE_DIM   = OUTPUT_DIM + 2 * BLUR_SIZE;
+  // 1. Declare Shared Memory for the "Red Region" core sum
+  __shared__ float shared_core_sum;
+  __shared__ int shared_core_count;
 
-  extern __shared__ float smem[];
-  float *tile    = smem;
-  float *rowSums = smem + TILE_DIM * TILE_DIM;
-
-  int outStartX = blockIdx.x * OUTPUT_DIM;
-  int outStartY = blockIdx.y * OUTPUT_DIM;
-
-  int tileStartX = outStartX - BLUR_SIZE;
-  int tileStartY = outStartY - BLUR_SIZE;
-
-  int tid        = threadIdx.y * BLOCK_SIZE + threadIdx.x;
-  int numThreads = BLOCK_SIZE * BLOCK_SIZE;
-
-  // Phase 1 — Load tile from global memory
-  int totalTile = TILE_DIM * TILE_DIM;
-  for (int idx = tid; idx < totalTile; idx += numThreads) {
-    int ty = idx / TILE_DIM;
-    int tx = idx % TILE_DIM;
-    int gx = tileStartX + tx;
-    int gy = tileStartY + ty;
-
-    tile[idx] = (gx >= 0 && gx < width && gy >= 0 && gy < height)
-                    ? in[gy * width + gx]
-                    : 0.0f;
+  // Initialize shared memory
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    shared_core_sum = 0.0f;
+    shared_core_count = 0;
   }
   __syncthreads();
 
-  // Phase 2 — Compute horizontal (row-wise) partial sums
-  int totalRowSums = TILE_DIM * OUTPUT_DIM;
-  for (int idx = tid; idx < totalRowSums; idx += numThreads) {
-    int row  = idx / OUTPUT_DIM;
-    int ocol = idx % OUTPUT_DIM;
+  // Define the core "Red Region" bounds based on the integer parameter 'a'
+  // For BLUR_SIZE=21 and BLOCK_DIM=16, a=1 is the max size that fits in all windows.
+  int a = 1;
+  int core_width = a * blockDim.x;
+  int core_height = a * blockDim.y;
+  
+  int core_start_x = blockIdx.x * blockDim.x;
+  int core_start_y = blockIdx.y * blockDim.y;
+  int core_end_x = core_start_x + core_width - 1;
+  int core_end_y = core_start_y + core_height - 1;
 
-    float sum = 0.0f;
-    int base = row * TILE_DIM + ocol;
-    for (int k = 0; k <= 2 * BLUR_SIZE; k++) {
-      sum += tile[base + k];
-    }
-    rowSums[idx] = sum;
+  // 2. Collaboratively compute the sum of the common core region
+  // Every thread adds its own pixel to the shared variable using fast atomics
+  if (col <= core_end_x && row <= core_end_y && col < width && row < height) {
+    atomicAdd(&shared_core_sum, in[row * width + col]);
+    atomicAdd(&shared_core_count, 1);
   }
   __syncthreads();
 
-  // Phase 3 — Accumulate row sums vertically and write output
-  for (int ii = 0; ii < TILE_I; ii++) {
-    for (int jj = 0; jj < TILE_I; jj++) {
-      int localRow = threadIdx.y + ii * BLOCK_SIZE;
-      int localCol = threadIdx.x + jj * BLOCK_SIZE;
+  // 3. Compute the final blur for each thread, reusing the shared core sum
+  if (col < width && row < height) {
+    float pixelValue = shared_core_sum; 
+    int numPixels = shared_core_count;       
 
-      int globalRow = outStartY + localRow;
-      int globalCol = outStartX + localCol;
+    for (int blurRow = -BLUR_SIZE; blurRow <= BLUR_SIZE; ++blurRow) {
+      for (int blurCol = -BLUR_SIZE; blurCol <= BLUR_SIZE; ++blurCol) {
+        
+        int curRow = row + blurRow;
+        int curCol = col + blurCol;
 
-      if (globalRow < height && globalCol < width) {
-        float sum = 0.0f;
-        int base = localRow * OUTPUT_DIM + localCol;
-        for (int k = 0; k <= 2 * BLUR_SIZE; k++) {
-          sum += rowSums[base + k * OUTPUT_DIM];
+        // SKIP the "red region" because it is already accumulated in pixelValue
+        if (curRow >= core_start_y && curRow <= core_end_y && 
+            curCol >= core_start_x && curCol <= core_end_x) {
+          continue; 
         }
 
-        int x0 = max(0, globalCol - BLUR_SIZE);
-        int x1 = min(width  - 1, globalCol + BLUR_SIZE);
-        int y0 = max(0, globalRow - BLUR_SIZE);
-        int y1 = min(height - 1, globalRow + BLUR_SIZE);
-        int count = (x1 - x0 + 1) * (y1 - y0 + 1);
-
-        out[globalRow * width + globalCol] = sum / count;
+        // Add only the remaining "fringe" pixels
+        if (curRow >= 0 && curRow < height && curCol >= 0 && curCol < width) {
+          pixelValue += in[curRow * width + curCol];
+          numPixels++; 
+        }
       }
     }
+
+    out[row * width + col] = pixelValue / (float)numPixels;
   }
 }
+//////////////////////////////////////////////////////
 
-///////////////////////////////////////////////////////////////////////////////
-// main — IDENTICAL to baseline (pageable memory, no warmup)
-///////////////////////////////////////////////////////////////////////////////
 int main(int argc, char *argv[]) {
   wbArg_t args;
   int imageWidth;
@@ -149,52 +112,43 @@ int main(int argc, char *argv[]) {
   hostOutputImageData = wbImage_getData(outputImage);
   goldOutputImageData = wbImage_getData(goldImage);
 
-  // NO cudaFree(0) warmup — same as baseline
-
-  const int OUTPUT_DIM = TILE_I * BLOCK_SIZE;
-  const int TILE_DIM   = OUTPUT_DIM + 2 * BLUR_SIZE;
-
-  int numBlocksX = (imageWidth  + OUTPUT_DIM - 1) / OUTPUT_DIM;
-  int numBlocksY = (imageHeight + OUTPUT_DIM - 1) / OUTPUT_DIM;
-  dim3 dimGrid(numBlocksX, numBlocksY);
-  dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-
-  size_t sharedMemBytes = (size_t)(TILE_DIM * TILE_DIM
-                                 + TILE_DIM * OUTPUT_DIM) * sizeof(float);
-
-  wbCheck(cudaFuncSetAttribute(blurKernelShared,
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               (int)sharedMemBytes));
+  // Force CUDA context initialization before timing
+  wbCheck(cudaFree(0));
 
   size_t numBytes = imageWidth * imageHeight * sizeof(float);
-
-  timespec timer = tic();
-
-  ////////////////////////////////////////////////
-  // Pageable memory transfers — same as baseline
 
   wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
   wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
 
+  int numBlocksX = (imageWidth + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int numBlocksY = (imageHeight + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  dim3 dimGrid(numBlocksX, numBlocksY);
+  dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+
+  timespec timer = tic();
+
+  ////////////////////////////////////////////////
+  // Standard, unoptimized pageable memory transfer
   wbCheck(cudaMemcpy(deviceInputImageData, hostInputImageData,
                      numBytes, cudaMemcpyHostToDevice));
 
-  // 10 kernel repeats — same as baseline
+  // Run the blur kernel 10 times for timing stability
   for (int i = 0; i < 10; i++) {
-    blurKernelShared<<<dimGrid, dimBlock, sharedMemBytes>>>(
-        deviceOutputImageData, deviceInputImageData,
-        imageWidth, imageHeight);
+    blurKernel<<<dimGrid, dimBlock>>>(deviceOutputImageData,
+                                      deviceInputImageData,
+                                      imageWidth,
+                                      imageHeight);
     wbCheck(cudaGetLastError());
   }
 
   wbCheck(cudaDeviceSynchronize());
 
+  // Standard, unoptimized pageable memory transfer back
   wbCheck(cudaMemcpy(hostOutputImageData, deviceOutputImageData,
                      numBytes, cudaMemcpyDeviceToHost));
+  ///////////////////////////////////////////////////////
 
-  ////////////////////////////////////////////////
-
-  toc(&timer, "GPU execution time (Shared Memory Optimization) in seconds");
+  toc(&timer, "GPU execution time (including data transfer) in seconds");
 
   // Correctness check
   for (int i = 0; i < imageHeight; i++) {
