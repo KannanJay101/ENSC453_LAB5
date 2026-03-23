@@ -1,72 +1,56 @@
-///////////////////////////////////////////////////////////////////////////////
-// =========================================================================
-// VARIATION: DATA TRANSFER OPTIMIZATION ONLY
-// =========================================================================
-//
-// What CHANGED from baseline:
-//   - Pinned host memory (cudaMallocHost) for faster CPU-GPU DMA transfers
-//   - cudaFree(0) warmup before timing to exclude CUDA context init
-//
-// What is IDENTICAL to baseline:
-//   - Naive blur kernel (reads directly from global memory, NO shared memory)
-//   - 10 kernel repeats for timing stability
-//   - Same grid/block dimensions (BLOCK_SIZE x BLOCK_SIZE = 16 x 16)
-//
-// Tile size:         N/A     (no tiling)
-// Threads per block: 256     (16 x 16)
-//
-// Compare execution time against baseline (1.265s) to isolate the
-// data transfer speedup:  speedup = (1.265 - this_time) / 1.265 * 100
-///////////////////////////////////////////////////////////////////////////////
-
 #include "libwb/wb.h"
 #include "my_timer.h"
-#include <math.h>
+#include <cmath>
 
-#define wbCheck(stmt)                                                   \
-  do {                                                                  \
-    cudaError_t err = stmt;                                             \
-    if (err != cudaSuccess) {                                           \
-      wbLog(ERROR, "Failed to run stmt ", #stmt);                       \
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));    \
-      return -1;                                                        \
-    }                                                                   \
+#define wbCheck(stmt)							\
+  do {									\
+    cudaError_t err = stmt;						\
+    if (err != cudaSuccess) {						\
+      wbLog(ERROR, "Failed to run stmt ", #stmt);			\
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));	\
+      return -1;							\
+    }									\
   } while (0)
 
 #define BLUR_SIZE 21
 #define BLOCK_SIZE 16
 
-///////////////////////////////////////////////////////////////////////////////
-// Baseline box blur kernel (global memory, no tiling) — UNCHANGED
-// Each thread computes one output pixel by averaging all valid pixels
-// in a (BLUR_SIZE x BLUR_SIZE) neighbourhood centred on (x, y).
-///////////////////////////////////////////////////////////////////////////////
-__global__ void blurKernel(float *out, float *in, int width, int height) {
+///////////////////////////////////////////////////////
+//@@ INSERT YOUR CODE HERE
+__global__ void blurKernel(float *out, const float *in, int width, int height) {
+  // Calculate the column (x) and row (y) indices of the current thread based on block and thread IDs
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  // Verify that the calculated thread position map to a valid pixel within the image bounds
+  if (col < width && row < height) {
+    float pixelValue = 0.0f; // Accumulator for the sum of pixel values in the blur window
+    int numPixels = 0;       // Counter for valid pixels processed
 
-  if (x >= width || y >= height) return;
+    // In this lab, BLUR_SIZE defines the blur radius, not the diameter.
+    // The window extends from -BLUR_SIZE to +BLUR_SIZE relative to the current pixel.
+    for (int blurRow = -BLUR_SIZE; blurRow <= BLUR_SIZE; ++blurRow) {
+      for (int blurCol = -BLUR_SIZE; blurCol <= BLUR_SIZE; ++blurCol) {
+        
+        // Calculate the absolute row and column coordinates of the neighboring pixel
+        int curRow = row + blurRow;
+        int curCol = col + blurCol;
 
-  float sum = 0.0f;
-  int count = 0;
-
-  for (int i = -BLUR_SIZE; i <= BLUR_SIZE; i++) {
-    for (int j = -BLUR_SIZE; j <= BLUR_SIZE; j++) {
-      int nx = x + j;
-      int ny = y + i;
-
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        sum += in[ny * width + nx];
-        count++;
+        // Ensure the neighboring pixel is actually inside the image bounds
+        if (curRow >= 0 && curRow < height && curCol >= 0 && curCol < width) {
+          // Accumulate the pixel's value using the 2D to 1D index mapping: (row * width) + col
+          pixelValue += in[curRow * width + curCol];
+          numPixels++; // Increment our count of valid pixels
+        }
       }
     }
+
+    // Calculate the average pixel value and set it in the output array
+    // We cast numPixels to float to ensure float division, although implicit conversion works too 
+    out[row * width + col] = pixelValue / (float)numPixels;
   }
-
-  out[y * width + x] = sum / count;
 }
-
-///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
   wbArg_t args;
