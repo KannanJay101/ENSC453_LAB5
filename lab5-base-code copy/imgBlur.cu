@@ -194,7 +194,7 @@ int main(int argc, char *argv[]) {
 
   ////////////////////////////////////////////////
 
-  toc(&timer, "GPU execution time (including data transfer) in seconds");
+  toc(&timer, "GPU execution time (Shared Memory Optimization) in seconds");
 
   // Correctness check
   for (int i = 0; i < imageHeight; i++) {
