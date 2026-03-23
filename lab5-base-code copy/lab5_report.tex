@@ -1,0 +1,242 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage[table]{xcolor}
+
+\title{ENSC 453/894 --- Lab 5: CUDA Image Blur Optimization Report}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{GPU:} Nvidia Ampere A4000 (48 SMs, 128 cores/SM, 164\,KB shared mem/SM, 2048 threads/SM)\\
+\textbf{Image:} 3840 $\times$ 2160 (grayscale, single-channel float)\\
+\textbf{BLUR\_SIZE:} 21 (blur window = 43 $\times$ 43 = 1,849 neighbours per pixel)\\
+\textbf{Kernel repeats:} 10 per run. All times include data transfer.
+
+%======================================================================
+\section{Shared Memory Optimization}
+%======================================================================
+
+\subsection{Strategy --- Separable Row/Column Sum Reuse}
+
+The baseline kernel performs $O((2R{+}1)^2) = O(1{,}849)$ global memory reads per output
+pixel. The optimized kernel exploits the fact that vertically adjacent pixels share
+42 out of 43 rows of their blur window. It proceeds in three phases on shared memory:
+
+\begin{enumerate}[]
+  \item \textbf{Tile Load:} Each block cooperatively loads a tile of
+        $(\text{OUTPUT\_DIM} + 2 \times \text{BLUR\_SIZE})^2$ pixels from global memory
+        into shared memory, zero-padding out-of-bounds pixels.
+  \item \textbf{Row Sums:} For every tile row and every output-column position,
+        accumulate 43 consecutive elements horizontally. Each row sum is reused by
+        up to 43 output pixels that share the same row in their blur window.
+  \item \textbf{Column Accumulation:} For each output pixel, sum 43 row sums
+        vertically and divide by the analytically computed neighbour count:
+        $(x_{\text{end}} - x_{\text{start}} + 1) \times (y_{\text{end}} - y_{\text{start}} + 1)$.
+\end{enumerate}
+
+This reduces per-pixel work from $O(1{,}849)$ to $O(2 \times 43) = O(86)$---a
+\textbf{21.5$\times$ arithmetic reduction}.
+
+\subsection{Tile Size Analysis}
+
+The tile multiplier $I$ (\texttt{TILE\_I}) controls how many output pixels each block
+produces. Each block of $16 \times 16 = 256$ threads outputs an $(I \cdot 16)^2$
+region; each thread handles $I^2$ pixels.
+
+\begin{table}[h]
+\centering
+\caption{Tile size sweep (shared memory kernel, 16$\times$16 blocks)}
+\smallskip
+\begin{tabular}{c c c r c c c}
+\toprule
+\textbf{TILE\_I} & \textbf{Output} & \textbf{Tile} & \textbf{Shared Mem} & \textbf{Blocks/SM} & \textbf{Occupancy} & \textbf{Time (s)} \\
+\midrule
+1 & 16$\times$16 & 58$\times$58   & 16.8\,KB & 8 (thread-lim.) & 100\%  & 0.0373 \\
+2 & 32$\times$32 & 74$\times$74   & 30.6\,KB & 5 (smem-lim.)   & 62.5\% & 0.0317 \\
+\rowcolor{green!15}
+\textbf{3} & \textbf{48$\times$48} & \textbf{90$\times$90} & \textbf{48.5\,KB} & \textbf{3 (smem-lim.)} & \textbf{37.5\%} & \textbf{0.0300} \\
+4 & 64$\times$64 & 106$\times$106 & 70.4\,KB & 2 (smem-lim.)   & 25\%   & 0.0308 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Best: TILE\_I\,=\,3} (0.030\,s). Despite only 37.5\% occupancy, the larger
+output region amortizes halo overhead: the ratio of useful output pixels to total tile
+pixels is $48^2/90^2 = 28.4\%$, versus $16^2/58^2 = 7.6\%$ for $I{=}1$. At $I{=}4$
+the halo ratio improves further (36.5\%) but occupancy drops to 25\%, and the SM can
+no longer hide memory latency with so few active warps, causing performance to plateau.
+
+%======================================================================
+\section{Thread Block Size Analysis}
+%======================================================================
+
+Tested on the naive kernel (global memory, no tiling) with pinned-memory transfers
+and \texttt{-O3 -use\_fast\_math}:
+
+\begin{table}[h]
+\centering
+\caption{Block size sweep (naive kernel, pinned memory)}
+\smallskip
+\begin{tabular}{c c c c c}
+\toprule
+\textbf{Block Size} & \textbf{Threads/Block} & \textbf{Blocks/SM} & \textbf{Occupancy} & \textbf{Time (s)} \\
+\midrule
+8$\times$8   & 64   & 32 (max-block lim.) & 100\% & 0.2184 \\
+\rowcolor{green!15}
+\textbf{16$\times$16} & \textbf{256} & \textbf{8} & \textbf{100\%} & \textbf{0.2152} \\
+32$\times$32 & 1024 & 2                   & 100\% & 0.2185 \\
+32$\times$8  & 256  & 8                   & 100\% & 0.2155 \\
+16$\times$8  & 128  & 16                  & 100\% & 0.2160 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All configurations achieve 100\% occupancy. \textbf{16$\times$16 is fastest} because:
+\begin{itemize}[]
+  \item The square shape maximises 2D spatial locality for the blur window.
+  \item 256 threads (8 warps) provides good latency hiding with minimal register
+        pressure, unlike the 1024-thread 32$\times$32 configuration.
+  \item 8$\times$8 blocks hit the 32-block/SM hardware limit, adding scheduling overhead.
+\end{itemize}
+
+%======================================================================
+\section{CPU--GPU Data Transfer Optimization}
+%======================================================================
+
+\subsection{Changes from Baseline}
+\begin{enumerate}[]
+  \item \texttt{cudaFree(0)} warmup --- forces CUDA context initialization before
+        timing begins (the baseline includes ${\sim}$1\,s of context init +
+        \texttt{cudaMalloc} in its timed section).
+  \item \textbf{Pinned host memory} --- \texttt{cudaMallocHost} replaces pageable
+        buffers, enabling direct DMA transfers over PCIe.
+  \item \textbf{Compiler flags} --- \texttt{-O3 -use\_fast\_math} added to \texttt{nvcc}
+        (baseline had no optimization flags).
+\end{enumerate}
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\caption{Data transfer optimization (naive kernel, 16$\times$16 blocks)}
+\smallskip
+\begin{tabular}{l c c}
+\toprule
+\textbf{Configuration} & \textbf{Time (s)} & \textbf{Speedup} \\
+\midrule
+Baseline (pageable mem, no warmup, no \texttt{-O3}) & 1.246 & 1.00$\times$ \\
+\rowcolor{green!15}
+Data Transfer Optimized (pinned, warmup, \texttt{-O3}) & 0.215 & 5.79$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 5.79$\times$ speedup comes primarily from excluding CUDA context initialization
+from timing (${\sim}$1\,s) and from faster DMA transfers with pinned memory. The
+kernel itself is unchanged.
+
+%======================================================================
+\section{Control Divergence Analysis}
+%======================================================================
+
+\subsection{Naive Kernel (16$\times$16 blocks)}
+
+\noindent\textbf{Grid:} $135 \times 240 = 32{,}400$ blocks, each with 8 warps
+$\Rightarrow$ \textbf{259,200 total warps.}
+
+\medskip\noindent\textbf{Source 1 --- Outer boundary check}
+(\texttt{if (x >= width || y >= height) return}):
+The grid perfectly tiles the image ($135 \times 16 = 2{,}160$;
+$240 \times 16 = 3{,}840$). \textbf{Zero divergent warps.}
+
+\medskip\noindent\textbf{Source 2 --- Inner-loop clamping}
+(\texttt{if (nx >= 0 \&\& nx < width \&\& ny >= 0 \&\& ny < height)}):
+Threads within 21 pixels of any image edge take a different branch from interior
+threads on some loop iterations.
+
+\begin{itemize}[]
+  \item Divergent block columns: 0--1 (left, $x < 21$) and 133--134 (right, $x > 2138$) = 4
+  \item Divergent block rows: 0--1 (top) and 238--239 (bottom) = 4
+  \item Interior blocks: $(135 - 4) \times (240 - 4) = 30{,}916$
+  \item Divergent blocks: $32{,}400 - 30{,}916 = 1{,}484$
+  \item Upper-bound divergent warps: $1{,}484 \times 8 = 11{,}872$
+\end{itemize}
+
+\[
+  \text{Divergence} = \frac{11{,}872}{259{,}200} = \mathbf{4.58\%}
+\]
+
+\subsection{Shared Memory Kernel (TILE\_I = 2, 16$\times$16 blocks)}
+
+\noindent\textbf{Grid:} $68 \times 120 = 8{,}160$ blocks $\Rightarrow$
+\textbf{65,280 total warps.}
+
+\begin{table}[h]
+\centering
+\caption{Divergence by kernel phase (shared memory kernel)}
+\smallskip
+\begin{tabular}{l l l}
+\toprule
+\textbf{Phase} & \textbf{Conditionals} & \textbf{Divergence} \\
+\midrule
+Phase 1 --- Tile Load & Ternary at image edges & ${\sim}$4.6\% of blocks (predicated) \\
+Phase 2 --- Row Sums  & Fixed loop $k = 0\ldots42$, none & 0\% \\
+Phase 3 --- Col Sums  & Boundary check, warp-uniform & ${\sim}$0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Effective computation divergence $\approx$ 0\%.} The separable design
+eliminates all data-dependent branches from the inner loops. Only tile loading at
+image edges incurs minor predicated divergence with negligible cost.
+
+%======================================================================
+\section{Overall Performance Summary}
+%======================================================================
+
+\begin{table}[h]
+\centering
+\caption{End-to-end comparison across branches}
+\smallskip
+\begin{tabular}{l l l c c}
+\toprule
+\textbf{Branch} & \textbf{Kernel} & \textbf{Transfer} & \textbf{Time (s)} & \textbf{Speedup} \\
+\midrule
+\texttt{baseline}             & Naive (global mem)     & Pageable       & 1.246 & 1.00$\times$ \\
+\texttt{data\_transfer-OPUS}  & Naive (global mem)     & Pinned+warmup  & 0.215 & 5.79$\times$ \\
+\rowcolor{green!15}
+\texttt{shared\_memory-OPUS}  & Shared mem + sep.\ reuse & Pinned+warmup & 0.030 & \textbf{41.5$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{Speedup Breakdown}
+
+\begin{center}
+\begin{tabular}{ccccc}
+Baseline & $\xrightarrow{\;5.79\times\;}$ & Data Transfer & $\xrightarrow{\;7.17\times\;}$ & Shared Memory \\
+1.246\,s & & 0.215\,s & & 0.030\,s \\
+& {\footnotesize pinned mem + warmup} & & {\footnotesize separable reuse} &
+\end{tabular}
+\end{center}
+
+\noindent The shared memory kernel's 7.17$\times$ speedup over the naive kernel
+(both with pinned memory) comes from:
+
+\begin{enumerate}[]
+  \item \textbf{Arithmetic reduction:} $O(86)$ vs $O(1{,}849)$ operations per pixel---a
+        21.5$\times$ reduction in computation.
+  \item \textbf{Memory hierarchy:} All intermediate reads from shared memory
+        (${\sim}$19\,TB/s) vs global memory (${\sim}$448\,GB/s)---a 42$\times$
+        bandwidth advantage.
+\end{enumerate}
+
+\noindent\textbf{Best configuration:} TILE\_I\,=\,3, BLOCK\_SIZE\,=\,16$\times$16,
+achieving \textbf{0.030\,s} total on the Nvidia A4000.
+
+\end{document}
