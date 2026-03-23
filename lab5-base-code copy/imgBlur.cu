@@ -2,14 +2,14 @@
 #include "my_timer.h"
 #include <cmath>
 
-#define wbCheck(stmt)							\
-  do {									\
-    cudaError_t err = stmt;						\
-    if (err != cudaSuccess) {						\
-      wbLog(ERROR, "Failed to run stmt ", #stmt);			\
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));	\
-      return -1;							\
-    }									\
+#define wbCheck(stmt)             \
+  do {                  \
+    cudaError_t err = stmt;           \
+    if (err != cudaSuccess) {           \
+      wbLog(ERROR, "Failed to run stmt ", #stmt);     \
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));  \
+      return -1;              \
+    }                 \
   } while (0)
 
 #define BLUR_SIZE 21
@@ -17,75 +17,40 @@
 
 ///////////////////////////////////////////////////////
 //@@ INSERT YOUR CODE HERE
-#ifndef C
-#define C 4
-#endif
-
 __global__ void blurKernel(float *out, const float *in, int width, int height) {
-    // Shared memory allocated for the tile and its horizontal halos
-    // size = BLOCK_SIZE rows * (C * BLOCK_SIZE + 2 * BLUR_SIZE) columns
-    __shared__ float sh_col_sums[BLOCK_SIZE][C * BLOCK_SIZE + 2 * BLUR_SIZE];
+  // 1. Thread Mapping: Calculate the global (x, y) coordinate for this thread
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int ty = threadIdx.y;
-    int tx = threadIdx.x;
-    int global_r = blockIdx.y * BLOCK_SIZE + ty;
-    
-    // Total elements to load and calculate in shared memory by this block
-    int total_elements = BLOCK_SIZE * (C * BLOCK_SIZE + 2 * BLUR_SIZE);
-    int tid = ty * BLOCK_SIZE + tx;
+  // 2. Bounds Checking: Ensure the thread maps to a valid pixel inside the image
+  if (col < width && row < height) {
+    float pixelValue = 0.0f; 
+    int numPixels = 0;       
 
-    // Phase 1: Collaboratively calculate vertical sums for all required columns
-    for (int i = tid; i < total_elements; i += BLOCK_SIZE * BLOCK_SIZE) {
-        int local_r = i / (C * BLOCK_SIZE + 2 * BLUR_SIZE);
-        int local_c = i % (C * BLOCK_SIZE + 2 * BLUR_SIZE);
+    // 3. The Blur Window: Iterate over the surrounding pixels
+    // BLUR_SIZE is the radius (21). The window is (2*BLUR_SIZE+1) x (2*BLUR_SIZE+1)
+    for (int blurRow = -BLUR_SIZE; blurRow <= BLUR_SIZE; ++blurRow) {
+      for (int blurCol = -BLUR_SIZE; blurCol <= BLUR_SIZE; ++blurCol) {
+        
+        int curRow = row + blurRow;
+        int curCol = col + blurCol;
 
-        int current_global_r = blockIdx.y * BLOCK_SIZE + local_r;
-        int current_global_c = blockIdx.x * (C * BLOCK_SIZE) - BLUR_SIZE + local_c;
-
-        float v_sum = 0.0f;
-        // Check if the current column is within the image bounds
-        // If it's outside, it will safely store 0.0f.
-        if (current_global_c >= 0 && current_global_c < width) {
-            int r_min = max(0, current_global_r - BLUR_SIZE);
-            int r_max = min(height - 1, current_global_r + BLUR_SIZE);
-            
-            for (int r = r_min; r <= r_max; ++r) {
-                v_sum += in[r * width + current_global_c];
-            }
+        // 4. Inner Bounds Check: Ensure the neighboring pixel isn't off the edge of the image
+        if (curRow >= 0 && curRow < height && curCol >= 0 && curCol < width) {
+          
+          // 5. Accumulate: Flatten the 2D index to 1D to read from the global 'in' array
+          pixelValue += in[curRow * width + curCol];
+          numPixels++; 
         }
-        sh_col_sums[local_r][local_c] = v_sum;
+      }
     }
 
-    // Wait for all threads to finish computing their subset of the vertical sums
-    __syncthreads();
-
-    // Phase 2: Compute the horizontal sums and write to output
-    if (global_r < height) {
-        // Each thread calculates C output pixels horizontally!
-        for (int iter = 0; iter < C; ++iter) {
-            int local_out_c = iter * BLOCK_SIZE + tx;
-            int global_c = blockIdx.x * (C * BLOCK_SIZE) + local_out_c;
-
-            if (global_c < width) {
-                float h_sum = 0.0f;
-                // Add the pre-calculated vertical sums horizontally
-                for (int dy = 0; dy <= 2 * BLUR_SIZE; ++dy) {
-                    h_sum += sh_col_sums[ty][local_out_c + dy];
-                }
-
-                // Compute exact number of valid pixels by calculating bounded rectangle dimension
-                int r_min = max(0, global_r - BLUR_SIZE);
-                int r_max = min(height - 1, global_r + BLUR_SIZE);
-                int c_min = max(0, global_c - BLUR_SIZE);
-                int c_max = min(width - 1, global_c + BLUR_SIZE);
-                int numPixels = (r_max - r_min + 1) * (c_max - c_min + 1);
-
-                out[global_r * width + global_c] = h_sum / (float)numPixels;
-            }
-        }
-    }
+    // 6. Average and Output: Write the final blurred value to the global 'out' array
+    out[row * width + col] = pixelValue / (float)numPixels;
+  }
 }
-///////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
   wbArg_t args;
@@ -123,16 +88,20 @@ int main(int argc, char *argv[]) {
 
   size_t numBytes = imageWidth * imageHeight * sizeof(float);
 
-  // Pinned memory for faster CPU-GPU DMA transfers
+  // ---------------------------------------------------------
+  // OPTIMIZATION: Allocate Pinned (Page-Locked) Memory
+  // ---------------------------------------------------------
   float *pinnedInput, *pinnedOutput;
   wbCheck(cudaMallocHost((void **)&pinnedInput, numBytes));
   wbCheck(cudaMallocHost((void **)&pinnedOutput, numBytes));
+  
+  // Copy image data from standard host memory to pinned memory
   memcpy(pinnedInput, hostInputImageData, numBytes);
 
   wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
   wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
 
-  int numBlocksX = (imageWidth + C * BLOCK_SIZE - 1) / (C * BLOCK_SIZE);
+  int numBlocksX = (imageWidth + BLOCK_SIZE - 1) / BLOCK_SIZE;
   int numBlocksY = (imageHeight + BLOCK_SIZE - 1) / BLOCK_SIZE;
   dim3 dimGrid(numBlocksX, numBlocksY);
   dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
@@ -140,30 +109,32 @@ int main(int argc, char *argv[]) {
   timespec timer = tic();
 
   ////////////////////////////////////////////////
-  // Pinned memory transfer (optimization) instead of pageable
+  // Transfer from PINNED memory to device (Faster DMA transfer)
   wbCheck(cudaMemcpy(deviceInputImageData, pinnedInput,
                      numBytes, cudaMemcpyHostToDevice));
 
-  // 10 kernel repeats — same as baseline
+  // Run the same blur kernel 10 times for timing stability.
   for (int i = 0; i < 10; i++) {
     blurKernel<<<dimGrid, dimBlock>>>(deviceOutputImageData,
                                       deviceInputImageData,
-                                      imageWidth, imageHeight);
+                                      imageWidth,
+                                      imageHeight);
     wbCheck(cudaGetLastError());
   }
 
   wbCheck(cudaDeviceSynchronize());
 
-  // Pinned memory transfer back
+  // Transfer from device back to PINNED memory
   wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,
                      numBytes, cudaMemcpyDeviceToHost));
+                     
+  // Copy back from pinned memory to standard host memory so wbImage can use it
   memcpy(hostOutputImageData, pinnedOutput, numBytes);
-
   ///////////////////////////////////////////////////////
 
-  toc(&timer, "GPU execution time (Data Transfer + Shared Mem Optimization) in seconds");
+  toc(&timer, "GPU execution time (including data transfer) in seconds");
 
-  // Correctness check against golden output
+  // Correctness check
   for (int i = 0; i < imageHeight; i++) {
     for (int j = 0; j < imageWidth; j++) {
       float gold = goldOutputImageData[i * imageWidth + j];
@@ -173,6 +144,8 @@ int main(int argc, char *argv[]) {
         if (fabs(outv - gold) / fabs(gold) > 0.01f) {
           printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
                  i, j, gold, outv);
+          cudaFreeHost(pinnedInput);
+          cudaFreeHost(pinnedOutput);
           cudaFree(deviceInputImageData);
           cudaFree(deviceOutputImageData);
           wbImage_delete(outputImage);
@@ -184,6 +157,8 @@ int main(int argc, char *argv[]) {
         if (fabs(outv - gold) > 1e-6f) {
           printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
                  i, j, gold, outv);
+          cudaFreeHost(pinnedInput);
+          cudaFreeHost(pinnedOutput);
           cudaFree(deviceInputImageData);
           cudaFree(deviceOutputImageData);
           wbImage_delete(outputImage);
@@ -197,8 +172,10 @@ int main(int argc, char *argv[]) {
 
   printf("Correct output image!\n");
 
+  // Free pinned memory
   cudaFreeHost(pinnedInput);
   cudaFreeHost(pinnedOutput);
+
   cudaFree(deviceInputImageData);
   cudaFree(deviceOutputImageData);
 
