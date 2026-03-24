@@ -48,6 +48,9 @@
 #define BLOCK_SIZE_X 32
 #define BLOCK_SIZE_Y 16
 
+float *pinnedInput;
+float *pinnedOutput;
+
 // L_PARAM: each thread handles 3 output pixels horizontally
 // Output width = 32 * 3 = 96 pixels per block
 // Halo overhead (42) spread across 96 useful columns = efficient
@@ -86,11 +89,6 @@ __global__ void blurKernel(float * __restrict__ out,
 
   // -----------------------------------------------------------------
   // Step 1: Load tile into shared memory (2D strided loop)
-  //
-  // Each thread walks the tile in 2D strides of blockDim.x / blockDim.y.
-  // This avoids the expensive idx / TILE_WIDTH division that a 1D loop
-  // would need. Since blockDim.x = 32 = warp size, consecutive threads
-  // in a warp access consecutive global memory addresses = coalesced.
   // -----------------------------------------------------------------
   for (int ty = threadIdx.y; ty < TILE_HEIGHT; ty += blockDim.y) {
     for (int tx = threadIdx.x; tx < TILE_WIDTH; tx += blockDim.x) {
@@ -108,10 +106,6 @@ __global__ void blurKernel(float * __restrict__ out,
 
   // -----------------------------------------------------------------
   // Step 2: Precompute vertical column sums
-  //
-  // For each column, sum 43 values vertically starting at threadIdx.y.
-  // Each thread handles multiple columns, striding by 32.
-  // This is done once — every output pixel in the same row reuses it.
   // -----------------------------------------------------------------
   for (int c = threadIdx.x; c < TILE_WIDTH; c += blockDim.x) {
     float vsum = 0.0f;
@@ -127,10 +121,6 @@ __global__ void blurKernel(float * __restrict__ out,
 
   // -----------------------------------------------------------------
   // Step 3: Horizontal accumulation across colSum values
-  //
-  // Each thread processes L_PARAM = 3 output pixels.
-  // For each pixel, sum 43 precomputed column sums horizontally.
-  // That's 43 adds instead of 43x43 = 1,849.
   // -----------------------------------------------------------------
   int outY = outBlockY + threadIdx.y;
   if (outY >= height) return;
@@ -218,11 +208,6 @@ int main(int argc, char *argv[]) {
 
   size_t numBytes = imageWidth * imageHeight * sizeof(float);
 
-  // =========================================================================
-  // SETUP: Pinned memory allocation (outside timer)
-  // =========================================================================
-  float *pinnedInput;
-  float *pinnedOutput;
 
   wbCheck(cudaMallocHost((void **)&pinnedInput, numBytes));
   wbCheck(cudaMallocHost((void **)&pinnedOutput, numBytes));
@@ -236,9 +221,8 @@ int main(int argc, char *argv[]) {
 
   timespec timer = tic();
 
-  // =========================================================================
-  // TIMED: DMA transfers + kernel execution
-  // =========================================================================
+  ////////////////////////////////////////////////
+  //@@ INSERT AND UPDATE YOUR CODE HERE
 
   // Fast pinned-to-device DMA transfer
   wbCheck(cudaMemcpy(deviceInputImageData, pinnedInput,
@@ -258,55 +242,41 @@ int main(int argc, char *argv[]) {
   wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,
                      numBytes, cudaMemcpyDeviceToHost));
 
-  toc(&timer, "GPU execution time (including data transfer) in seconds");
-
-  // =========================================================================
-  // TEARDOWN: Copy back and verify (outside timer)
-  // =========================================================================
+                     
   memcpy(hostOutputImageData, pinnedOutput, numBytes);
+ ////////////////////////////////////////////////
+
+
+  toc(&timer, "GPU execution time (including data transfer) in seconds");
 
   for (int i = 0; i < imageHeight; i++) {
     for (int j = 0; j < imageWidth; j++) {
-      float gold = goldOutputImageData[i * imageWidth + j];
-      float outv = hostOutputImageData[i * imageWidth + j];
-
-      if (fabs(gold) > 1e-6f) {
-        if (fabs(outv - gold) / fabs(gold) > 0.01f) {
-          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
-                 i, j, gold, outv);
-          cudaFreeHost(pinnedInput);
-          cudaFreeHost(pinnedOutput);
-          cudaFree(deviceInputImageData);
-          cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage);
-          wbImage_delete(inputImage);
-          wbImage_delete(goldImage);
-          return -1;
-        }
-      } else {
-        if (fabs(outv - gold) > 1e-6f) {
-          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
-                 i, j, gold, outv);
-          cudaFreeHost(pinnedInput);
-          cudaFreeHost(pinnedOutput);
-          cudaFree(deviceInputImageData);
-          cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage);
-          wbImage_delete(inputImage);
-          wbImage_delete(goldImage);
-          return -1;
-        }
+      float diff =
+          fabsf(hostOutputImageData[i * imageWidth + j] -
+                goldOutputImageData[i * imageWidth + j]);
+      float denom = fabsf(goldOutputImageData[i * imageWidth + j]);
+      if ((denom > 1.0e-6f && diff / denom > 0.01f) ||
+          (denom <= 1.0e-6f && diff > 1.0e-6f)) {
+        printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
+               i, j, goldOutputImageData[i * imageWidth + j],
+               hostOutputImageData[i * imageWidth + j]);
+        cudaFreeHost(pinnedInput);
+        cudaFreeHost(pinnedOutput);
+        cudaFree(deviceInputImageData);
+        cudaFree(deviceOutputImageData);
+        wbImage_delete(outputImage);
+        wbImage_delete(inputImage);
+        wbImage_delete(goldImage);
+        return -1;
       }
     }
   }
-
   printf("Correct output image!\n");
 
   cudaFreeHost(pinnedInput);
   cudaFreeHost(pinnedOutput);
   cudaFree(deviceInputImageData);
   cudaFree(deviceOutputImageData);
-
   wbImage_delete(outputImage);
   wbImage_delete(inputImage);
   wbImage_delete(goldImage);
