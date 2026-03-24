@@ -41,13 +41,25 @@
     }                                                                   \
   } while (0)
 
-#define BLUR_SIZE 21
+#define BLUR_SIZE 21  // square window; radius = (BLUR_SIZE-1)/2
 
+
+///////////////////////////////////////////////////////////////////////////////
+// Optimized blur kernel
+//
+// Step 1: All 512 threads cooperatively load tile into shared memory
+//         using 2D strided loop (avoids slow integer division)
+// Step 2: Precompute vertical column sums — done once per column,
+//         reused by all output pixels in the same row
+// Step 3: Each thread computes L_PARAM output pixels by summing
+//         horizontally across precomputed column sums (43 adds each)
+///////////////////////////////////////////////////////////////////////////////
 // Block dimensions: 32 wide = one warp per row (coalesced access)
 // 16 tall = 512 threads total, allows multiple blocks per SM
 #define BLOCK_SIZE_X 32
 #define BLOCK_SIZE_Y 16
 
+// Pinned host buffers (filled in main; used for fast H<->D copies)
 float *pinnedInput;
 float *pinnedOutput;
 
@@ -62,16 +74,6 @@ float *pinnedOutput;
 #define TILE_WIDTH  (OUT_WIDTH  + 2 * BLUR_SIZE)     // 96 + 42 = 138
 #define TILE_HEIGHT (OUT_HEIGHT + 2 * BLUR_SIZE)     // 16 + 42 = 58
 
-///////////////////////////////////////////////////////////////////////////////
-// Optimized blur kernel
-//
-// Step 1: All 512 threads cooperatively load tile into shared memory
-//         using 2D strided loop (avoids slow integer division)
-// Step 2: Precompute vertical column sums — done once per column,
-//         reused by all output pixels in the same row
-// Step 3: Each thread computes L_PARAM output pixels by summing
-//         horizontally across precomputed column sums (43 adds each)
-///////////////////////////////////////////////////////////////////////////////
 __global__ void blurKernel(float * __restrict__ out,
                            const float * __restrict__ in,
                            int width, int height) {
@@ -200,7 +202,14 @@ int main(int argc, char *argv[]) {
   hostOutputImageData = wbImage_getData(outputImage);
   goldOutputImageData = wbImage_getData(goldImage);
 
-  // Grid: one block per 96x16 output region
+  wbCheck(cudaFree(0));
+
+  timespec timer = tic();
+
+////////////////////////////////////////////////
+//@@ INSERT AND UPDATE YOUR CODE HERE
+
+  // Cover image with blocks of OUT_WIDTH x OUT_HEIGHT output pixels each
   int numBlocksX = (imageWidth + OUT_WIDTH - 1) / OUT_WIDTH;
   int numBlocksY = (imageHeight + OUT_HEIGHT - 1) / OUT_HEIGHT;
   dim3 dimGrid(numBlocksX, numBlocksY);
@@ -208,21 +217,14 @@ int main(int argc, char *argv[]) {
 
   size_t numBytes = imageWidth * imageHeight * sizeof(float);
 
-
+  // Host pinned + device global allocations
   wbCheck(cudaMallocHost((void **)&pinnedInput, numBytes));
   wbCheck(cudaMallocHost((void **)&pinnedOutput, numBytes));
   wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
   wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
 
+  // Stage input on pinned memory, then DMA to GPU
   memcpy(pinnedInput, hostInputImageData, numBytes);
-
-  // Force CUDA context init before timing
-  wbCheck(cudaFree(0));
-
-  timespec timer = tic();
-
-  ////////////////////////////////////////////////
-  //@@ INSERT AND UPDATE YOUR CODE HERE
 
   // Fast pinned-to-device DMA transfer
   wbCheck(cudaMemcpy(deviceInputImageData, pinnedInput,
@@ -239,10 +241,11 @@ int main(int argc, char *argv[]) {
   wbCheck(cudaDeviceSynchronize());
 
   // Fast device-to-pinned DMA transfer
+
   wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,
                      numBytes, cudaMemcpyDeviceToHost));
 
-                     
+  // Copy result into wbImage buffer for optional export / compare
   memcpy(hostOutputImageData, pinnedOutput, numBytes);
  ////////////////////////////////////////////////
 
@@ -273,6 +276,7 @@ int main(int argc, char *argv[]) {
   }
   printf("Correct output image!\n");
 
+  // Release GPU + pinned host memory and wb images
   cudaFreeHost(pinnedInput);
   cudaFreeHost(pinnedOutput);
   cudaFree(deviceInputImageData);
