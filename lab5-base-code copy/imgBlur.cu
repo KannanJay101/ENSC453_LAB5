@@ -13,6 +13,9 @@
   } while (0)
 
 #define BLUR_SIZE 21
+
+///////////////////////////////////////////////////////
+//@@ INSERT YOUR CODE HERE
 #define BLOCK_SIZE_X 32
 #define BLOCK_SIZE_Y 16
 #define L_PARAM 3
@@ -23,8 +26,6 @@
 #define TILE_WIDTH  (OUT_WIDTH  + 2 * BLUR_SIZE)     // 96 + 42 = 138
 #define TILE_HEIGHT (OUT_HEIGHT + 2 * BLUR_SIZE)     // 16 + 42 = 58
 
-///////////////////////////////////////////////////////
-//@@ INSERT YOUR CODE HERE
 __global__ void blurKernel(float *out, float *in, int width, int height) {
 
   __shared__ float tile[TILE_HEIGHT][TILE_WIDTH];
@@ -126,6 +127,11 @@ int main(int argc, char *argv[]) {
   hostOutputImageData = wbImage_getData(outputImage);
   goldOutputImageData = wbImage_getData(goldImage);
 
+  // Start timer
+  timespec timer = tic();
+
+  ////////////////////////////////////////////////
+  //@@ INSERT AND UPDATE YOUR CODE HERE
   int numBlocksX = (imageWidth + OUT_WIDTH - 1) / OUT_WIDTH;
   int numBlocksY = (imageHeight + OUT_HEIGHT - 1) / OUT_HEIGHT;
   dim3 dimGrid(numBlocksX, numBlocksY);
@@ -145,11 +151,7 @@ int main(int argc, char *argv[]) {
 
   wbCheck(cudaFree(0));
 
-  // Start timer
-  timespec timer = tic();
 
-  ////////////////////////////////////////////////
-  //@@ INSERT AND UPDATE YOUR CODE HERE
   wbCheck(cudaMemcpy(deviceInputImageData, pinnedInput,
                      numBytes, cudaMemcpyHostToDevice));
 
@@ -163,63 +165,32 @@ int main(int argc, char *argv[]) {
   wbCheck(cudaDeviceSynchronize());
 
   // Fast DMA transfer from device to pinned host memory
-  wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,
-                     numBytes, cudaMemcpyDeviceToHost));
+  wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,numBytes, cudaMemcpyDeviceToHost));
+
+  memcpy(hostOutputImageData, pinnedOutput, numBytes);  
 
   ///////////////////////////////////////////////////////
-  
   // Stop and print timer
   toc(&timer, "GPU execution time (including data transfer) in seconds");
 
   // Check the correctness of your solution
   //wbSolution(args, outputImage);
-  memcpy(hostOutputImageData, pinnedOutput, numBytes);
 
-  for (int i = 0; i < imageHeight; i++) {
-    for (int j = 0; j < imageWidth; j++) {
-      float gold = goldOutputImageData[i * imageWidth + j];
-      float outv = hostOutputImageData[i * imageWidth + j];
-
-      if (fabs(gold) > 1e-6f) {
-        if (fabs(outv - gold) / fabs(gold) > 0.01f) {
-          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
-                 i, j, gold, outv);
-          cudaFreeHost(pinnedInput);
-          cudaFreeHost(pinnedOutput);
-          cudaFree(deviceInputImageData);
-          cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage);
-          wbImage_delete(inputImage);
-          wbImage_delete(goldImage);
-          return -1;
-        }
-      } else {
-        if (fabs(outv - gold) > 1e-6f) {
-          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
-                 i, j, gold, outv);
-          cudaFreeHost(pinnedInput);
-          cudaFreeHost(pinnedOutput);
-          cudaFree(deviceInputImageData);
-          cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage);
-          wbImage_delete(inputImage);
-          wbImage_delete(goldImage);
-          return -1;
-        }
+  for(int i=0; i<imageHeight; i++){
+    for(int j=0; j<imageWidth; j++){
+      if(abs(hostOutputImageData[i*imageWidth+j]-goldOutputImageData[i*imageWidth+j])/goldOutputImageData[i*imageWidth+j]>0.01){
+        printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n", i, j, goldOutputImageData[i*imageWidth+j],hostOutputImageData[i*imageWidth+j]);
+  return -1;
       }
     }
   }
-
   printf("Correct output image!\n");
 
-  cudaFreeHost(pinnedInput);
-  cudaFreeHost(pinnedOutput);
-  cudaFree(deviceInputImageData);
-  cudaFree(deviceOutputImageData);
+ cudaFree(deviceInputImageData);
+ cudaFree(deviceOutputImageData);
 
-  wbImage_delete(outputImage);
-  wbImage_delete(inputImage);
-  wbImage_delete(goldImage);
+ wbImage_delete(outputImage);
+ wbImage_delete(inputImage);
 
-  return 0;
+ return 0;
 }
