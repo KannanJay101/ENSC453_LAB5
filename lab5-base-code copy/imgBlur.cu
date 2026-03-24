@@ -23,12 +23,8 @@
 #define TILE_WIDTH  (OUT_WIDTH  + 2 * BLUR_SIZE)     // 96 + 42 = 138
 #define TILE_HEIGHT (OUT_HEIGHT + 2 * BLUR_SIZE)     // 16 + 42 = 58
 
-///////////////////////////////////////////////////////////////////////////////
-// PART 1 OPTIMIZATION: Shared memory with computation reuse.
-// Step 1: Load tile into shared memory via 2D strided loop (no slow division).
-// Step 2: Precompute 1D vertical column sums (unrolled loop).
-// Step 3: Each thread computes 3 output pixels by horizontally adding column sums.
-///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////
+//@@ INSERT YOUR CODE HERE
 __global__ void blurKernel(float *out, float *in, int width, int height) {
 
   __shared__ float tile[TILE_HEIGHT][TILE_WIDTH];
@@ -40,7 +36,6 @@ __global__ void blurKernel(float *out, float *in, int width, int height) {
   int tileStartX = outBlockX - BLUR_SIZE;
   int tileStartY = outBlockY - BLUR_SIZE;
 
-  // --- Step 1: Cooperatively load tile into shared memory ---
   for (int ty = threadIdx.y; ty < TILE_HEIGHT; ty += blockDim.y) {
     for (int tx = threadIdx.x; tx < TILE_WIDTH; tx += blockDim.x) {
       int gx = tileStartX + tx;
@@ -55,7 +50,6 @@ __global__ void blurKernel(float *out, float *in, int width, int height) {
 
   __syncthreads();
 
-  // --- Step 2: Precompute vertical column sums ---
   for (int c = threadIdx.x; c < TILE_WIDTH; c += blockDim.x) {
     float vsum = 0.0f;
     
@@ -68,7 +62,6 @@ __global__ void blurKernel(float *out, float *in, int width, int height) {
 
   __syncthreads();
 
-  // --- Step 3: Compute final output pixels ---
   int outY = outBlockY + threadIdx.y;
   if (outY >= height) return;
 
@@ -97,7 +90,7 @@ __global__ void blurKernel(float *out, float *in, int width, int height) {
   }
 }
 
-///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
   wbArg_t args;
@@ -113,7 +106,7 @@ int main(int argc, char *argv[]) {
   float *deviceOutputImageData;
   float *goldOutputImageData;
 
-  args = wbArg_read(argc, argv);
+  args = wbArg_read(argc, argv); /* parse the input arguments */
 
   inputImageFile = wbArg_getInputFile(args, 0);
   inputImage = wbImport(inputImageFile);
@@ -121,11 +114,14 @@ int main(int argc, char *argv[]) {
   char *goldImageFile = argv[2];
   goldImage = wbImport(goldImageFile);
 
+  // The input image is in grayscale, so the number of channels is 1
   imageWidth  = wbImage_getWidth(inputImage);
   imageHeight = wbImage_getHeight(inputImage);
 
+  // Since the image is monochromatic, it only contains only one channel
   outputImage = wbImage_new(imageWidth, imageHeight, 1);
 
+  // Get host input and output image data
   hostInputImageData  = wbImage_getData(inputImage);
   hostOutputImageData = wbImage_getData(outputImage);
   goldOutputImageData = wbImage_getData(goldImage);
@@ -137,9 +133,6 @@ int main(int argc, char *argv[]) {
 
   size_t numBytes = imageWidth * imageHeight * sizeof(float);
 
-  // =========================================================================
-  // SETUP PHASE: Memory allocation and OS-level operations (OUTSIDE THE TIMER)
-  // =========================================================================
   float *pinnedInput;
   float *pinnedOutput;
 
@@ -148,18 +141,15 @@ int main(int argc, char *argv[]) {
   wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
   wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
 
-  // Copy standard host memory to pinned memory (CPU-side only, not timed)
   memcpy(pinnedInput, hostInputImageData, numBytes);
 
-  // Force CUDA context init before timing
   wbCheck(cudaFree(0));
 
-  // =========================================================================
-  // EXECUTION PHASE: DMA Transfers and Kernel Processing (INSIDE THE TIMER)
-  // =========================================================================
+  // Start timer
   timespec timer = tic();
 
-  // Fast DMA transfer from pinned host memory to device
+  ////////////////////////////////////////////////
+  //@@ INSERT AND UPDATE YOUR CODE HERE
   wbCheck(cudaMemcpy(deviceInputImageData, pinnedInput,
                      numBytes, cudaMemcpyHostToDevice));
 
@@ -176,11 +166,13 @@ int main(int argc, char *argv[]) {
   wbCheck(cudaMemcpy(pinnedOutput, deviceOutputImageData,
                      numBytes, cudaMemcpyDeviceToHost));
 
+  ///////////////////////////////////////////////////////
+  
+  // Stop and print timer
   toc(&timer, "GPU execution time (including data transfer) in seconds");
 
-  // =========================================================================
-  // TEARDOWN PHASE: Copy back to standard buffer and verify (OUTSIDE THE TIMER)
-  // =========================================================================
+  // Check the correctness of your solution
+  //wbSolution(args, outputImage);
   memcpy(hostOutputImageData, pinnedOutput, numBytes);
 
   for (int i = 0; i < imageHeight; i++) {
