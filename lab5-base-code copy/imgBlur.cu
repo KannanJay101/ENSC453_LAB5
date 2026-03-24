@@ -1,52 +1,45 @@
 #include "libwb/wb.h"
 #include "my_timer.h"
-#include <math.h>
 
-#define wbCheck(stmt)                                                   \
-  do {                                                                  \
-    cudaError_t err = stmt;                                             \
-    if (err != cudaSuccess) {                                           \
-      wbLog(ERROR, "Failed to run stmt ", #stmt);                       \
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));    \
-      return -1;                                                        \
-    }                                                                   \
+#define wbCheck(stmt)							\
+  do {									\
+    cudaError_t err = stmt;						\
+    if (err != cudaSuccess) {						\
+      wbLog(ERROR, "Failed to run stmt ", #stmt);			\
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));	\
+      return -1;							\
+    }									\
   } while (0)
 
 #define BLUR_SIZE 21
-#define BLOCK_SIZE 16
 
-///////////////////////////////////////////////////////
-// Baseline box blur kernel (global memory, no tiling)
-// Each thread computes one output pixel by averaging all valid pixels
-// in a (BLUR_SIZE x BLUR_SIZE) neighbourhood centred on (x, y).
-// Border pixels use only the neighbours that fall inside the image
-// (clamped / partial-window averaging).
+// @@ INSERT YOUR CODE HERE (Lines 16-20)
+// Baseline: Global Memory Only
+
 __global__ void blurKernel(float *out, float *in, int width, int height) {
-  
-  //One thread = one pixel
-  int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (x >= width || y >= height) return; //Boundary check
+    if (col < width && row < height) {
+        float pixVal = 0.0f;
+        int pixels = 0;
 
-  float sum = 0.0f;
-  int count = 0;
+        // Iterate over the blur window
+        for(int blurRow = -BLUR_SIZE; blurRow <= BLUR_SIZE; ++blurRow) {
+            for(int blurCol = -BLUR_SIZE; blurCol <= BLUR_SIZE; ++blurCol) {
+                int curRow = row + blurRow;
+                int curCol = col + blurCol;
 
-  for (int i = -BLUR_SIZE; i <= BLUR_SIZE; i++) {
-    for (int j = -BLUR_SIZE; j <= BLUR_SIZE; j++) {
-      int nx = x + j;
-      int ny = y + i;
-
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        sum += in[ny * width + nx];
-        count++;
-      }
+                // Verify boundaries
+                if(curRow > -1 && curRow < height && curCol > -1 && curCol < width) {
+                    pixVal += in[curRow * width + curCol];
+                    pixels++;
+                }
+            }
+        }
+        out[row * width + col] = pixVal / pixels;
     }
-  }
-
-  out[y * width + x] = sum / count;
 }
-///////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
   wbArg_t args;
@@ -62,7 +55,7 @@ int main(int argc, char *argv[]) {
   float *deviceOutputImageData;
   float *goldOutputImageData;
 
-  args = wbArg_read(argc, argv);
+  args = wbArg_read(argc, argv); /* parse the input arguments */
 
   inputImageFile = wbArg_getInputFile(args, 0);
   inputImage = wbImport(inputImageFile);
@@ -70,90 +63,71 @@ int main(int argc, char *argv[]) {
   char *goldImageFile = argv[2];
   goldImage = wbImport(goldImageFile);
 
+  // The input image is in grayscale, so the number of channels is 1
   imageWidth  = wbImage_getWidth(inputImage);
   imageHeight = wbImage_getHeight(inputImage);
 
+  // Since the image is monochromatic, it only contains only one channel
   outputImage = wbImage_new(imageWidth, imageHeight, 1);
 
+  // Get host input and output image data
   hostInputImageData  = wbImage_getData(inputImage);
   hostOutputImageData = wbImage_getData(outputImage);
   goldOutputImageData = wbImage_getData(goldImage);
 
+  // Start timer
   timespec timer = tic();
-
+  
   ////////////////////////////////////////////////
   //@@ INSERT AND UPDATE YOUR CODE HERE
 
-  int numBlocksX = (imageWidth + BLOCK_SIZE - 1) / BLOCK_SIZE;
-  int numBlocksY = (imageHeight + BLOCK_SIZE - 1) / BLOCK_SIZE;
-  dim3 dimGrid(numBlocksX, numBlocksY);
-  dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+  // Allocate cuda memory for device input and ouput image data
+  cudaMalloc((void **)&deviceInputImageData,
+             imageWidth * imageHeight * sizeof(float));
+  cudaMalloc((void **)&deviceOutputImageData,
+             imageWidth * imageHeight * sizeof(float));
 
-  size_t numBytes = imageWidth * imageHeight * sizeof(float);
+  // Transfer data from CPU to GPU
+  cudaMemcpy(deviceInputImageData, hostInputImageData,
+             imageWidth * imageHeight * sizeof(float),
+             cudaMemcpyHostToDevice);
 
-  wbCheck(cudaMalloc((void **)&deviceInputImageData, numBytes));
-  wbCheck(cudaMalloc((void **)&deviceOutputImageData, numBytes));
+  dim3 dimBlock(16, 16, 1);
+  dim3 dimGrid((imageWidth + 15) / 16, (imageHeight + 15) / 16, 1);
 
-  wbCheck(cudaMemcpy(deviceInputImageData, hostInputImageData,
-                     numBytes, cudaMemcpyHostToDevice));
-
-  // Run the same blur kernel 10 times for timing stability.
-  // Do NOT swap buffers; each launch should use the original input.
-  for (int i = 0; i < 10; i++) {
+  // Call your GPU kernel 10 times
+  for(int i = 0; i < 10; i++)
     blurKernel<<<dimGrid, dimBlock>>>(deviceOutputImageData,
-                                      deviceInputImageData,
-                                      imageWidth,
+                                      deviceInputImageData, imageWidth,
                                       imageHeight);
-    wbCheck(cudaGetLastError());
-  }
 
-  wbCheck(cudaDeviceSynchronize());
-
-  wbCheck(cudaMemcpy(hostOutputImageData, deviceOutputImageData,
-                     numBytes, cudaMemcpyDeviceToHost));
+  // Transfer data from GPU to CPU
+  cudaMemcpy(hostOutputImageData, deviceOutputImageData,
+             imageWidth * imageHeight * sizeof(float),
+             cudaMemcpyDeviceToHost);
   ///////////////////////////////////////////////////////
+  
+  // Stop and print timer
+  toc(&timer, "GPU execution time (including data transfer) in seconds");
 
-  toc(&timer, "GPU execution time (Baseline) in seconds");
+  // Check the correctness of your solution
+  //wbSolution(args, outputImage);
 
-  for (int i = 0; i < imageHeight; i++) {
-    for (int j = 0; j < imageWidth; j++) {
-      float gold = goldOutputImageData[i * imageWidth + j];
-      float outv = hostOutputImageData[i * imageWidth + j];
-
-      if (fabs(gold) > 1e-6f) {
-        if (fabs(outv - gold) / fabs(gold) > 0.01f) {
-          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
-                 i, j, gold, outv);
-          cudaFree(deviceInputImageData);
-          cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage);
-          wbImage_delete(inputImage);
-          wbImage_delete(goldImage);
-          return -1;
-        }
-      } else {
-        if (fabs(outv - gold) > 1e-6f) {
-          printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n",
-                 i, j, gold, outv);
-          cudaFree(deviceInputImageData);
-          cudaFree(deviceOutputImageData);
-          wbImage_delete(outputImage);
-          wbImage_delete(inputImage);
-          wbImage_delete(goldImage);
-          return -1;
-        }
-      }
-    }
-  }
-
-  printf("Correct output image!\n");
+   for(int i=0; i<imageHeight; i++){
+     for(int j=0; j<imageWidth; j++){
+       if(abs(hostOutputImageData[i*imageWidth+j]-goldOutputImageData[i*imageWidth+j])/goldOutputImageData[i*imageWidth+j]>0.01){
+         printf("Incorrect output image at pixel (%d, %d): goldOutputImage = %f, hostOutputImage = %f\n", i, j, goldOutputImageData[i*imageWidth+j],hostOutputImageData[i*imageWidth+j]);
+	 return -1;
+       }
+     }
+   }
+   printf("Correct output image!\n");
 
   cudaFree(deviceInputImageData);
   cudaFree(deviceOutputImageData);
 
   wbImage_delete(outputImage);
   wbImage_delete(inputImage);
-  wbImage_delete(goldImage);
 
   return 0;
 }
